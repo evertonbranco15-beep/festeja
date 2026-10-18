@@ -1,6 +1,9 @@
 (() => {
   'use strict';
   const STORAGE_KEY = 'festeja-planner-v1';
+  const SUPABASE_URL = 'https://cjoasktqvxendspxabfc.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_yYfc-J5PK1ha7dgfF4R33g_4V7Q_gWh';
+  const SHARED_HASH = /^#\/p\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
   const TYPES = {
     batizado: { label: 'Batizado', emoji: '🕊️', decoration: '🕊️ 👶 ✝️', color: '#8faebe', accent: '#dfc88e' },
     aniversario: { label: 'Aniversário', emoji: '🎂', decoration: '✨ 🎂 ✨', color: '#c77d67', accent: '#e8b7a5' },
@@ -51,7 +54,165 @@
   let mapInteraction = null;
   let dragGuestId = null;
   let dragPreview = null;
-  let saveTimer;
+  const syncTimers = new Map();
+  const syncing = new Set();
+  const revisions = new Map();
+  const deferredRemote = new Map();
+  let syncError = false;
+  let polling = false;
+  async function rpc(name, args) {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${name}`, {
+      method: 'POST', headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(args)
+    });
+    if (!response.ok) throw new Error(`Falha de sincronização (${response.status})`);
+    return response.json();
+  }
+  function sharedPayload(party) {
+    const { sharedId, sharedVersion, syncPending, ...fields } = party;
+    return { ...fields, tasks: party.tasks.map(({ sentReminders, snoozeUntil, snoozeSent, ...task }) => task) };
+  }
+  function mergeById(local, remote) {
+    const localIds = new Set(local.map(item => item.id));
+    return [...local, ...remote.filter(item => !localIds.has(item.id))];
+  }
+  function mergeParty(local, remote) {
+    return { ...remote, ...local, guests: mergeById(local.guests, remote.guests || []),
+      tables: mergeById(local.tables, remote.tables || []), tasks: mergeById(local.tasks, remote.tasks || []) };
+  }
+  function persist() { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); renderHeader(); }
+  function updateSyncStatus() {
+    const party = activeParty(); const status = $('#sync-status');
+    status.hidden = !party.sharedId;
+    if (!party.sharedId) return;
+    const pending = party.syncPending || syncing.has(party.sharedId);
+    status.textContent = !navigator.onLine || syncError ? 'Offline, será enviado depois' : pending ? 'Sincronizando…' : 'Sincronizado ✓';
+  }
+  function schedulePush(sharedId, delay = 800) {
+    clearTimeout(syncTimers.get(sharedId));
+    syncTimers.set(sharedId, setTimeout(() => { syncTimers.delete(sharedId); pushShared(sharedId); }, delay));
+  }
+  async function pushShared(sharedId) {
+    const party = data.parties.find(item => item.sharedId === sharedId);
+    if (!party?.syncPending || syncing.has(sharedId) || !navigator.onLine) { updateSyncStatus(); return; }
+    syncing.add(sharedId); updateSyncStatus();
+    try {
+      const rows = await rpc('get_shared_party', { p_id: sharedId });
+      if (!rows.length) throw new Error('Festa compartilhada não encontrada');
+      const current = data.parties.find(item => item.sharedId === sharedId);
+      if (!current?.syncPending) return;
+      if (Number(rows[0].version) > Number(current.sharedVersion || 0)) {
+        Object.assign(current, mergeParty(current, rows[0].data));
+        persist();
+      }
+      const revision = revisions.get(sharedId) || 0;
+      const saved = await rpc('save_shared_party', { p_id: sharedId, p_data: sharedPayload(current) });
+      if (!saved.length) throw new Error('Festa compartilhada não encontrada');
+      if (current.sharedId !== sharedId) return;
+      current.sharedVersion = Number(saved[0].version);
+      if ((revisions.get(sharedId) || 0) === revision) current.syncPending = false;
+      syncError = false; persist();
+    } catch (error) {
+      console.warn('Não foi possível sincronizar a festa.', error);
+      syncError = true; updateSyncStatus();
+    } finally {
+      syncing.delete(sharedId);
+      updateSyncStatus();
+      if (data.parties.some(item => item.sharedId === sharedId && item.syncPending) && navigator.onLine && !syncError) schedulePush(sharedId);
+    }
+  }
+  function renderCurrent() {
+    renderHeader();
+    if (currentScreen === 'inicio') renderHome();
+    if (currentScreen === 'convidados') renderGuests();
+    if (currentScreen === 'mesas') renderTables();
+    if (currentScreen === 'tarefas') renderTasks();
+    if (currentScreen === 'resumo') renderSummary();
+  }
+  function applyRemote(sharedId, row) {
+    const index = data.parties.findIndex(item => item.sharedId === sharedId);
+    if (index < 0 || data.parties[index].syncPending || syncing.has(sharedId)) return;
+    const local = data.parties[index];
+    if (Number(row.version) <= Number(local.sharedVersion || 0)) return;
+    if (document.querySelector('dialog[open]')) { deferredRemote.set(sharedId, row); return; }
+    const reminderState = new Map(local.tasks.map(task => [task.id, {
+      sentReminders: task.sentReminders || [], snoozeUntil: task.snoozeUntil || null, snoozeSent: task.snoozeSent || false
+    }]));
+    data.parties[index] = { ...row.data, id: local.id, sharedId, sharedVersion: Number(row.version), syncPending: false,
+      tasks: (row.data.tasks || []).map(task => ({ ...task, ...reminderState.get(task.id) })) };
+    persist(); renderCurrent();
+  }
+  function applyDeferredRemote() {
+    if (document.querySelector('dialog[open]')) return;
+    for (const [sharedId, row] of deferredRemote) { deferredRemote.delete(sharedId); applyRemote(sharedId, row); }
+  }
+  async function pollShared() {
+    if (document.hidden || polling) return;
+    const party = activeParty(); if (!party.sharedId) return;
+    if (party.syncPending) { if (navigator.onLine) schedulePush(party.sharedId, 0); return; }
+    polling = true;
+    try {
+      const rows = await rpc('get_shared_party', { p_id: party.sharedId });
+      if (!rows.length) { showToast('Festa compartilhada não encontrada'); return; }
+      if (Number(rows[0].version) > Number(party.sharedVersion || 0)) applyRemote(party.sharedId, rows[0]);
+      syncError = false; updateSyncStatus();
+    } catch (error) { console.warn('Falha ao buscar alterações.', error); syncError = true; updateSyncStatus(); }
+    finally { polling = false; }
+  }
+  async function openSharedLink() {
+    const match = location.hash.match(SHARED_HASH); if (!match) return;
+    const sharedId = match[1].toLowerCase();
+    try {
+      const rows = await rpc('get_shared_party', { p_id: sharedId });
+      if (!rows.length) { showToast('Festa compartilhada não encontrada'); return; }
+      if (location.hash.toLowerCase() !== `#/p/${sharedId}`) return;
+      const remote = rows[0];
+      let party = data.parties.find(item => item.sharedId === sharedId || item.id === remote.data.id);
+      if (party?.syncPending) schedulePush(sharedId, 0);
+      else if (party) {
+        party.sharedId = sharedId;
+        applyRemote(sharedId, remote);
+      } else {
+        party = { ...remote.data, sharedId, sharedVersion: Number(remote.version), syncPending: false };
+        data.parties.push(party);
+      }
+      data.activePartyId = party.id;
+      persist(); renderCurrent(); showToast('Festa compartilhada aberta');
+    } catch (error) { console.warn('Não foi possível abrir o link.', error); showToast('Erro ao abrir festa compartilhada'); }
+  }
+  function sharedLink(sharedId) { return `${location.href.split('#')[0]}#/p/${sharedId}`; }
+  function showShareDialog(party) {
+    $('#share-link').value = sharedLink(party.sharedId);
+    $('#web-share').disabled = !navigator.share;
+    $('#share-dialog').showModal();
+  }
+  async function shareForEditing(partyId, button) {
+    const party = data.parties.find(item => item.id === partyId);
+    if (!party) return;
+    if (party.sharedId) { showShareDialog(party); return; }
+    button.disabled = true;
+    try {
+      const revision = revisions.get(party.id) || 0;
+      const rows = await rpc('create_shared_party', { p_data: sharedPayload(party) });
+      if (!rows.length) throw new Error('Não foi possível criar o link');
+      party.sharedId = rows[0].id;
+      party.sharedVersion = Number(rows[0].version);
+      party.syncPending = (revisions.get(party.id) || 0) !== revision;
+      syncError = false; persist(); renderCurrent();
+      if (party.syncPending) schedulePush(party.sharedId);
+      if ($('#party-dialog').open) $('#party-dialog').close();
+      showShareDialog(party);
+    } catch (error) { console.warn('Não foi possível compartilhar.', error); showToast('Erro ao compartilhar. Tente novamente.'); }
+    finally { button.disabled = false; }
+  }
+  function stopSync(party) {
+    if (!party.sharedId) return;
+    clearTimeout(syncTimers.get(party.sharedId)); syncTimers.delete(party.sharedId);
+    deferredRemote.delete(party.sharedId);
+    if (location.hash.toLowerCase() === `#/p/${party.sharedId.toLowerCase()}`) history.replaceState(null, '', location.href.split('#')[0]);
+    delete party.sharedId; delete party.sharedVersion; delete party.syncPending;
+    persist(); renderCurrent(); showToast('Sincronização desativada neste dispositivo');
+  }
   const $ = selector => document.querySelector(selector);
   const $$ = selector => [...document.querySelectorAll(selector)];
   const activeParty = () => data.parties.find(party => party.id === data.activePartyId) || data.parties[0];
@@ -88,11 +249,17 @@
     document.documentElement.style.setProperty('--primary-ink', contrastColor(primary));
     $('#event-emoji').textContent = theme.emoji;
     $('#event-label').textContent = party.name;
+    updateSyncStatus();
     document.querySelector('meta[name="theme-color"]').content = primary;
   }
-  function save() {
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); renderHeader(); }, 120);
+  function save(sync = true) {
+    const party = activeParty();
+    if (sync && party.sharedId) {
+      party.syncPending = true;
+      revisions.set(party.sharedId, (revisions.get(party.sharedId) || 0) + 1);
+      schedulePush(party.sharedId);
+    }
+    persist();
   }
   function renderHeader() {
     applyTheme();
@@ -123,7 +290,7 @@
     $('#screen-inicio').innerHTML = `<div class="welcome-row"><div class="party-home-heading"><p class="eyebrow">SEU EVENTO, SEM ESTRESSE</p><h1 id="home-title">Um dia lindo<br>começa por aqui.</h1><p class="subtext">Organize cada detalhe com carinho ✨</p></div><div class="welcome-art">${theme.emoji}</div></div>
       <article class="hero-card" data-decoration="${theme.decoration}"><p class="eyebrow">${escapeHTML(theme.label)}${party.theme ? ` · ${escapeHTML(party.theme)}` : ''}</p><h2>${escapeHTML(party.name)}</h2><div class="hero-meta">${fmtDate(party.date)}${party.time ? ` · ${party.time}` : ''}${party.venue ? ` · ${escapeHTML(party.venue)}` : ''}</div><div class="hero-stats"><div class="hero-stat"><strong>${party.guests.length}</strong><span>convidados</span></div><div class="hero-stat"><strong>${party.tables.length}</strong><span>mesas</span></div><div class="hero-stat"><strong>${confirmed}</strong><span>confirmados</span></div></div></article>
       <div class="section-heading"><h2>Suas festas</h2><button class="text-button" data-action="new-party">＋ Criar festa</button></div>
-      <div class="party-grid">${data.parties.map(item => `<button class="party-card" type="button" data-action="select-party" data-id="${item.id}"><span class="party-emblem">${partyTheme(item.type).emoji}</span><span><h3>${escapeHTML(item.name)}</h3><p>${fmtDate(item.date)} · ${item.guests.length} convidados</p></span><span class="party-arrow">›</span></button>`).join('')}</div>
+      <div class="party-grid">${data.parties.map(item => `<button class="party-card" type="button" data-action="select-party" data-id="${item.id}"><span class="party-emblem">${partyTheme(item.type).emoji}</span><span><h3>${escapeHTML(item.name)}</h3><p>${fmtDate(item.date)} · ${item.guests.length} convidados ${item.sharedId ? '· <span class="shared-badge">🔗 Compartilhada</span>' : ''}</p></span><span class="party-arrow">›</span></button>`).join('')}</div>
       <div class="section-heading"><h2>Próximos prazos</h2><button class="text-button" data-go="tarefas">Ver tarefas</button></div>
       ${tasks.length ? `<div class="deadline-list">${tasks.map(task => deadlineMarkup(task)).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">☀️</div>Sem tarefas pendentes. Aproveite!</div>`}
       <p class="install-note">Dica: adicione à tela inicial para usar como app.</p>`;
@@ -182,13 +349,13 @@
     const capacity = party.tables.reduce((sum, table) => sum + table.chairs, 0);
     const done = party.tasks.filter(task => task.status === 'concluida').length;
     const nextTasks = [...party.tasks].filter(task => task.status !== 'concluida').sort((a,b) => new Date(a.due) - new Date(b.due)).slice(0,3);
-    $('#screen-resumo').innerHTML = `<div class="page-title-row"><div><p class="eyebrow">${escapeHTML(party.name)}</p><h1 id="summary-title">Tudo em um olhar</h1></div><span class="welcome-art">${partyTheme(party.type).emoji}</span></div><article class="hero-card" data-decoration="${partyTheme(party.type).decoration}"><p class="eyebrow">${escapeHTML(partyTheme(party.type).label)}${party.theme ? ` · ${escapeHTML(party.theme)}` : ''}</p><h2>${escapeHTML(party.name)}</h2><div class="hero-meta">${fmtDate(party.date)}${party.time ? ` · ${party.time}` : ''}<br>${escapeHTML(party.venue || 'Local a definir')}</div></article><div class="stats-grid"><div class="stat-card"><strong>${party.guests.length}</strong><span>convidados</span></div><div class="stat-card"><strong>${confirmed}</strong><span>confirmados</span></div><div class="stat-card"><strong>${occupied}/${capacity}</strong><span>lugares usados</span></div></div><div class="section-heading"><h2>Preparativos</h2><span class="muted" style="font-size:11px">${done}/${party.tasks.length} concluídas</span></div><div class="progress-track"><span style="width:${party.tasks.length ? Math.round(done / party.tasks.length * 100) : 0}%"></span></div><div class="progress-caption"><span>Progresso das tarefas</span><strong>${party.tasks.length ? Math.round(done / party.tasks.length * 100) : 0}%</strong></div><div class="summary-actions"><button class="button primary" data-action="export-png">⬇ Baixar mapa PNG</button><button class="button secondary" data-action="export-pdf">▤ PDF / Imprimir</button><button class="button ghost" data-action="share-event">↗ Compartilhar</button></div><div class="section-heading"><h2>Próximas tarefas</h2><button class="text-button" data-go="tarefas">Ver todas</button></div><div class="deadline-list">${nextTasks.map(task => deadlineMarkup(task, '')).join('') || '<div class="empty-state">Tudo concluído por aqui 🎉</div>'}</div><div class="section-heading"><h2>Convidados por mesa</h2></div><div class="summary-list">${party.tables.map(table => { const people = party.guests.filter(g => g.seatId?.startsWith(`${table.id}-`)); return `<div class="summary-row"><strong>${escapeHTML(table.name)}</strong><span>${people.length ? people.map(g => escapeHTML(g.name)).join(', ') : 'Nenhum convidado'} <span class="muted">· ${table.chairs - people.length} lugares livres</span></span></div>`; }).join('')}</div><div class="notice">Os dados ficam salvos automaticamente neste dispositivo. Para exportar PDF, escolha “Salvar como PDF” na janela de impressão.</div>`;
+    $('#screen-resumo').innerHTML = `<div class="page-title-row"><div><p class="eyebrow">${escapeHTML(party.name)}</p><h1 id="summary-title">Tudo em um olhar</h1></div><span class="welcome-art">${partyTheme(party.type).emoji}</span></div><article class="hero-card" data-decoration="${partyTheme(party.type).decoration}"><p class="eyebrow">${escapeHTML(partyTheme(party.type).label)}${party.theme ? ` · ${escapeHTML(party.theme)}` : ''}</p><h2>${escapeHTML(party.name)}</h2><div class="hero-meta">${fmtDate(party.date)}${party.time ? ` · ${party.time}` : ''}<br>${escapeHTML(party.venue || 'Local a definir')}</div></article><div class="stats-grid"><div class="stat-card"><strong>${party.guests.length}</strong><span>convidados</span></div><div class="stat-card"><strong>${confirmed}</strong><span>confirmados</span></div><div class="stat-card"><strong>${occupied}/${capacity}</strong><span>lugares usados</span></div></div><div class="section-heading"><h2>Preparativos</h2><span class="muted" style="font-size:11px">${done}/${party.tasks.length} concluídas</span></div><div class="progress-track"><span style="width:${party.tasks.length ? Math.round(done / party.tasks.length * 100) : 0}%"></span></div><div class="progress-caption"><span>Progresso das tarefas</span><strong>${party.tasks.length ? Math.round(done / party.tasks.length * 100) : 0}%</strong></div><div class="summary-actions"><button class="button primary" data-action="share-edit">🔗 Compartilhar para edição</button>${party.sharedId ? '<button class="button ghost" data-action="stop-sync">Parar de sincronizar</button>' : ''}<button class="button primary" data-action="export-png">⬇ Baixar mapa PNG</button><button class="button secondary" data-action="export-pdf">▤ PDF / Imprimir</button><button class="button ghost" data-action="share-event">↗ Compartilhar</button></div><div class="section-heading"><h2>Próximas tarefas</h2><button class="text-button" data-go="tarefas">Ver todas</button></div><div class="deadline-list">${nextTasks.map(task => deadlineMarkup(task, '')).join('') || '<div class="empty-state">Tudo concluído por aqui 🎉</div>'}</div><div class="section-heading"><h2>Convidados por mesa</h2></div><div class="summary-list">${party.tables.map(table => { const people = party.guests.filter(g => g.seatId?.startsWith(`${table.id}-`)); return `<div class="summary-row"><strong>${escapeHTML(table.name)}</strong><span>${people.length ? people.map(g => escapeHTML(g.name)).join(', ') : 'Nenhum convidado'} <span class="muted">· ${table.chairs - people.length} lugares livres</span></span></div>`; }).join('')}</div><div class="notice">${party.sharedId ? '🔗 Compartilhada · alterações sincronizadas entre dispositivos.' : 'Os dados ficam salvos automaticamente neste dispositivo.'} Para exportar PDF, escolha “Salvar como PDF” na janela de impressão.</div>`;
   }
   function showToast(message) {
     const toast = $('#toast'); toast.textContent = message; toast.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('show'), 2500);
   }
   function openPartyForm(party = null) {
-    const form = $('#party-form'); form.reset(); form.elements.id.value = party?.id || ''; $('#party-dialog-title').textContent = party ? 'Editar festa' : 'Criar festa'; $('#delete-party').classList.toggle('hidden', !party); const theme = partyTheme(party?.type || 'batizado');
+    const form = $('#party-form'); form.reset(); form.elements.id.value = party?.id || ''; $('#party-dialog-title').textContent = party ? 'Editar festa' : 'Criar festa'; $('#delete-party').classList.toggle('hidden', !party); $('#party-share-actions').classList.toggle('hidden', !party); $('#stop-party-sync').classList.toggle('hidden', !party?.sharedId); const theme = partyTheme(party?.type || 'batizado');
     form.elements.name.value = party?.name || ''; form.elements.date.value = party?.date || dateInput(addDays(new Date(), 30)); form.elements.time.value = party?.time || '16:00'; form.elements.venue.value = party?.venue || ''; form.elements.type.value = party?.type || 'batizado'; form.elements.theme.value = party?.theme || ''; form.elements.color.value = party?.color || theme.color; form.elements.accent.value = party?.accent || theme.accent; form.elements.estimate.value = party?.estimate ?? 50; $('#party-dialog').showModal();
   }
   function openGuestForm(guest = null) {
@@ -202,7 +369,7 @@
     const fields = Object.fromEntries(new FormData(form)); const existing = data.parties.find(item => item.id === fields.id); const defaults = partyTheme(fields.type);
     if (existing) Object.assign(existing, { name: fields.name.trim(), date: fields.date, time: fields.time, venue: fields.venue.trim(), type: fields.type, theme: fields.theme.trim(), color: fields.color || defaults.color, accent: fields.accent || defaults.accent, estimate: Number(fields.estimate) || 0 });
     else { const party = { id: id(), name: fields.name.trim(), date: fields.date, time: fields.time, venue: fields.venue.trim(), type: fields.type, theme: fields.theme.trim(), color: fields.color || defaults.color, accent: fields.accent || defaults.accent, estimate: Number(fields.estimate) || 0, guests: [], tables: [], tasks: [] }; data.parties.push(party); data.activePartyId = party.id; }
-    save(); $('#party-dialog').close(); renderHeader(); go('inicio'); showToast('Festa salva com carinho ✨');
+    save(!!existing); $('#party-dialog').close(); renderHeader(); go('inicio'); showToast('Festa salva com carinho ✨');
   }
   function assignGuest(guestId, seatId) {
     const party = activeParty(); const marker = seatId.lastIndexOf('-c');
@@ -230,7 +397,7 @@
     $('#guest-picker-dialog').showModal();
   }
   function openPartyPicker() {
-    $('#party-picker').innerHTML = `<div class="modal-head"><div><p class="eyebrow">SELECIONE UMA FESTA</p><h2>Seus eventos</h2></div><button class="close-button" data-close-party-picker aria-label="Fechar">×</button></div><div class="party-grid">${data.parties.map(party => `<button class="party-card" data-action="select-party" data-id="${party.id}"><span class="party-emblem">${partyTheme(party.type).emoji}</span><span><h3>${escapeHTML(party.name)}</h3><p>${fmtDate(party.date)} · ${party.guests.length} convidados</p></span></button>`).join('')}</div><button class="button primary full" data-action="new-party" style="margin-top:14px">＋ Criar outra festa</button>`;
+    $('#party-picker').innerHTML = `<div class="modal-head"><div><p class="eyebrow">SELECIONE UMA FESTA</p><h2>Seus eventos</h2></div><button class="close-button" data-close-party-picker aria-label="Fechar">×</button></div><div class="party-grid">${data.parties.map(party => `<button class="party-card" data-action="select-party" data-id="${party.id}"><span class="party-emblem">${partyTheme(party.type).emoji}</span><span><h3>${escapeHTML(party.name)}</h3><p>${fmtDate(party.date)} · ${party.guests.length} convidados ${party.sharedId ? '· <span class="shared-badge">🔗 Compartilhada</span>' : ''}</p></span></button>`).join('')}</div><button class="button primary full" data-action="new-party" style="margin-top:14px">＋ Criar outra festa</button>`;
     $('#party-picker-dialog').showModal();
   }
   function addTable(form) {
@@ -280,11 +447,11 @@
         if(now>=trigger&&!task.sentReminders?.includes(key)) { task.sentReminders=task.sentReminders||[];task.sentReminders.push(key);changed=true;deliverNotification(task.title,{body:`${reminderLabel(minutes)} · ${party.name}`,tag:`${task.id}-${key}`}); }
       }
     }
-    if(changed) save();
+    if(changed) { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
   }
   function snoozeTask(taskId, minutes) {
     const task=activeParty().tasks.find(item=>item.id===taskId); if(!task) return;
-    task.snoozeUntil=new Date(Date.now()+minutes*60000).toISOString();task.snoozeSent=false;save();renderTasks();showToast(`Lembrete adiado por ${minutes>=1440?'1 dia':'1 hora'}`);
+    task.snoozeUntil=new Date(Date.now()+minutes*60000).toISOString();task.snoozeSent=false;save(false);renderTasks();showToast(`Lembrete adiado por ${minutes>=1440?'1 dia':'1 hora'}`);
   }
   function taskAction(taskId, action) {
     const task=activeParty().tasks.find(item=>item.id===taskId); if(!task) return;
@@ -295,7 +462,7 @@
     const target=event.target.closest('[data-action]'); if(!target) return;
     const action=target.dataset.action; const taskId=target.dataset.id;
     if(action==='new-party'){if($('#party-picker-dialog').open)$('#party-picker-dialog').close();openPartyForm();}
-    if(action==='select-party'){data.activePartyId=target.dataset.id;save();$('#party-picker-dialog').close();go('inicio');}
+    if(action==='select-party'){data.activePartyId=target.dataset.id;save(false);$('#party-picker-dialog').close();go('inicio');pollShared();}
     if(action==='new-guest') openGuestForm();
     if(action==='edit-guest') openGuestForm(activeParty().guests.find(item=>item.id===target.dataset.id));
     if(action==='new-task') openTaskForm();
@@ -315,22 +482,44 @@
     if(action==='export-png') exportPNG();
     if(action==='export-pdf'){fillPrintSheet();window.print();}
     if(action==='share-event') shareEvent();
+    if(action==='share-edit') shareForEditing(activeParty().id, target);
+    if(action==='stop-sync') stopSync(activeParty());
   }
   document.addEventListener('click', event => {
     if(event.target.closest('[data-go]')) {const screen=event.target.closest('[data-go]').dataset.go;go(screen);return;}
     if(event.target.closest('.nav-item')){go(event.target.closest('.nav-item').dataset.go);return;}
     if(event.target.closest('#edit-party')){openPartyForm(activeParty());return;}
+    if(event.target.closest('[data-close-dialog]')){event.target.closest('dialog').close();return;}
     if(event.target.closest('#event-switch')){openPartyPicker();return;}
     if(event.target.closest('[data-close-table]')){$('#table-dialog').close();return;}
     if(event.target.closest('[data-close-picker]')){$('#guest-picker-dialog').close();return;}
     if(event.target.closest('[data-close-party-picker]')){$('#party-picker-dialog').close();return;}
+    if(event.target.closest('#party-share-actions')) return;
     if(event.target.closest('#enable-notifications')){askNotificationPermission();return;}
     const remove=event.target.closest('[data-remove-custom]');if(remove){customReminderValues.splice(Number(remove.dataset.removeCustom),1);renderCustomReminders();return;}
     delegatedAction(event);
   });
+  $('#party-share-actions').addEventListener('click', event => {
+    const button = event.target.closest('[data-action]'); if (!button) return;
+    const party = data.parties.find(item => item.id === $('#party-form').elements.id.value);
+    if (!party) return;
+    if (button.dataset.action === 'share-edit') {
+      if (!$('#party-form').reportValidity()) return;
+      submitParty($('#party-form'));
+      shareForEditing(party.id, button);
+    }
+    if (button.dataset.action === 'stop-sync') { stopSync(party); $('#party-dialog').close(); }
+  });
+  $('#copy-share-link').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText($('#share-link').value); showToast('Link copiado!'); }
+    catch (error) { $('#share-link').select(); showToast('Selecione e copie o link'); }
+  });
+  $('#web-share').addEventListener('click', () => {
+    if (navigator.share) navigator.share({ title: activeParty().name, url: $('#share-link').value }).catch(() => {});
+  });
   $('#party-form').addEventListener('submit',event=>{event.preventDefault();submitParty(event.currentTarget);});
   $('#party-form').elements.type.addEventListener('change',event=>{const theme=partyTheme(event.target.value);$('#party-form').elements.color.value=theme.color;$('#party-form').elements.accent.value=theme.accent;});
-  $('#delete-party').addEventListener('click',()=>{const party=activeParty();if(data.parties.length<2){showToast('Mantenha ao menos uma festa');return;}if(confirm(`Excluir “${party.name}” e todos os dados dela?`)){data.parties=data.parties.filter(item=>item.id!==party.id);data.activePartyId=data.parties[0].id;save();$('#party-dialog').close();go('inicio');showToast('Festa removida');}});
+  $('#delete-party').addEventListener('click',()=>{const party=activeParty();if(data.parties.length<2){showToast('Mantenha ao menos uma festa');return;}if(confirm(`Excluir “${party.name}” e todos os dados dela?`)){data.parties=data.parties.filter(item=>item.id!==party.id);data.activePartyId=data.parties[0].id;save(false);$('#party-dialog').close();go('inicio');showToast('Festa removida');}});
   $('#guest-form').addEventListener('submit',event=>{event.preventDefault();const fields=Object.fromEntries(new FormData(event.currentTarget));const list=activeParty().guests;const guest=list.find(item=>item.id===fields.id);if(guest)Object.assign(guest,{name:fields.name.trim(),group:fields.group.trim(),status:fields.status,notes:fields.notes.trim()});else list.push({id:id(),name:fields.name.trim(),group:fields.group.trim(),status:fields.status,notes:fields.notes.trim(),seatId:null});save();$('#guest-dialog').close();renderGuests();showToast('Convidado salvo');});
   $('#delete-guest').addEventListener('click',()=>{const id=$('#guest-form').elements.id.value;if(confirm('Remover este convidado da festa?')){activeParty().guests=activeParty().guests.filter(item=>item.id!==id);save();$('#guest-dialog').close();renderGuests();showToast('Convidado removido');}});
   $('#task-form').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;const fields=Object.fromEntries(new FormData(form));const reminders=[...new Set([...$$('#task-form input[name="reminders"]:checked').map(input=>Number(input.value)),...customReminderValues])];const list=activeParty().tasks;const task=list.find(item=>item.id===fields.id);if(task)Object.assign(task,{title:fields.title.trim(),due:fields.due,owner:fields.owner.trim(),notes:fields.notes.trim(),reminders,status:task.status==='concluida'?'concluida':'pendente',sentReminders:[],snoozeUntil:null,snoozeSent:false});else list.push({id:id(),title:fields.title.trim(),due:fields.due,owner:fields.owner.trim(),notes:fields.notes.trim(),reminders,status:'pendente',sentReminders:[],snoozeUntil:null});save();$('#task-dialog').close();renderTasks();checkReminders();showToast('Tarefa salva');});
@@ -361,10 +550,17 @@
     if(interaction.kind==='table'){if(interaction.moved){save();renderTables();}else openTable(interaction.id);}
   });
   document.addEventListener('pointerdown',event=>{const item=event.target.closest('.guest-drag');if(!item)return;dragGuestId=item.dataset.guestId;event.preventDefault();});
-  document.addEventListener('visibilitychange',()=>{if(!document.hidden)checkReminders();});
-  window.addEventListener('focus',checkReminders);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden){checkReminders();pollShared();}});
+  window.addEventListener('focus',()=>{checkReminders();pollShared();});
+  window.addEventListener('online',()=>{syncError = false; for (const party of data.parties) if (party.sharedId && party.syncPending) schedulePush(party.sharedId, 0); pollShared(); updateSyncStatus();});
+  window.addEventListener('offline', updateSyncStatus);
+  window.addEventListener('hashchange', openSharedLink);
+  document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('close', applyDeferredRemote));
+  setInterval(pollShared, 5000);
   setInterval(checkReminders,30000);
   $('#party-dialog').addEventListener('click',event=>{if(event.target===$('#party-dialog')&&event.offsetY<0)$('#party-dialog').close();});
   if('serviceWorker' in navigator && location.protocol!=='file:') navigator.serviceWorker.register('./sw.js').then(()=>checkReminders()).catch(error=>console.warn('Service worker indisponível',error));
   applyTheme();renderHeader();go('inicio');
+  for (const party of data.parties) if (party.sharedId && party.syncPending) schedulePush(party.sharedId, 0);
+  openSharedLink(); pollShared();
 })();
