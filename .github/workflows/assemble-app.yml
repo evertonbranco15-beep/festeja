@@ -1,0 +1,40 @@
+name: assemble-app
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/assemble-app.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  pages: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and verify files
+        run: |
+          set -euo pipefail
+          B=https://customer-assets-jt897jd0.emergentagent.net/wingman/3e7c60a7-8f7b-4379-b317-d5aca58ae79a/attachments
+          fetch() { curl -fsSL --retry 5 --retry-delay 3 "$B/$1" -o "$2.new"; echo "$3  $2.new" | md5sum -c -; mv "$2.new" "$2"; }
+          fetch 3170f52a789f4665b6bf662f552f5d8e_app.js app.js a7a7455cc38c860966b3c2492ecfc92b
+          fetch c84a1dd45972433886671093caf3fb71_styles.css styles.css 1a4ad6c077174384d053d8b221708658
+          fetch 0fb93bd302d3433bb5f097a92177fafb_index.html index.html ce708ceb6d8d62ed6f79128060ac576c
+          fetch 655a1956fe9a40b69d5584d5ae08a757_sw.js sw.js 1675f0b2c3e5c21802d9e8d8e486c381
+          md5sum app.js styles.css index.html sw.js
+      - name: Commit and clean up
+        run: |
+          set -euo pipefail
+          git config user.name "festeja-bot"
+          git config user.email "festeja-bot@users.noreply.github.com"
+          rm -f app.part*.js
+          git rm -q --cached --ignore-unmatch app.part*.js || true
+          git rm -q .github/workflows/assemble-app.yml
+          git add app.js styles.css index.html sw.js
+          git commit -m "Festeja: botão Nova festa, excluir festas, estado sem festas (cache v9)"
+          git push origin HEAD:main
+      - name: Request Pages build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/pages/builds" || echo "pages build request failed (auto build may still run)"
