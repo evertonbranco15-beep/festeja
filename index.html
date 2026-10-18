@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#fffaf5">
+  <meta name="description" content="Planeje sua festa com convidados, mesas e tarefas em um só lugar.">
+  <title>Festeja — seu evento, sem estresse</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-192.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#inicio" aria-label="Festeja, início"><span class="brand-mark">✿</span><span>festeja<span class="brand-dot">.</span></span></a>
+      <button class="event-switch" id="event-switch" type="button" aria-label="Selecionar festa"><span id="event-emoji">🕊️</span><span id="event-label">Minha festa</span><span class="chevron">⌄</span></button>
+      <button class="icon-button" id="edit-party" type="button" aria-label="Editar festa">✎</button>
+    </header>
+    <main id="app-main" tabindex="-1">
+      <section class="screen active" id="screen-inicio" data-screen="inicio" aria-labelledby="home-title"></section>
+      <section class="screen" id="screen-convidados" data-screen="convidados" aria-labelledby="guests-title"></section>
+      <section class="screen" id="screen-mesas" data-screen="mesas" aria-labelledby="tables-title"></section>
+      <section class="screen" id="screen-tarefas" data-screen="tarefas" aria-labelledby="tasks-title"></section>
+      <section class="screen" id="screen-resumo" data-screen="resumo" aria-labelledby="summary-title"></section>
+    </main>
+    <nav class="bottom-nav" aria-label="Navegação principal">
+      <button class="nav-item active" data-go="inicio" type="button"><span>⌂</span><small>Início</small></button>
+      <button class="nav-item" data-go="convidados" type="button"><span>♡</span><small>Convidados</small></button>
+      <button class="nav-item" data-go="mesas" type="button"><span>▦</span><small>Mesas</small></button>
+      <button class="nav-item" data-go="tarefas" type="button"><span>☷</span><small>Tarefas</small></button>
+      <button class="nav-item" data-go="resumo" type="button"><span>✧</span><small>Resumo</small></button>
+    </nav>
+  </div>
+  <dialog id="party-dialog" class="modal"><form id="party-form" method="dialog"><div class="modal-head"><div><p class="eyebrow">UM DIA ESPECIAL</p><h2 id="party-dialog-title">Criar festa</h2></div><button class="close-button" value="cancel" aria-label="Fechar">×</button></div>
+    <input type="hidden" name="id">
+    <label>Nome da festa<input name="name" required maxlength="80" placeholder="Ex.: Aniversário da Maria"></label>
+    <div class="form-grid"><label>Data<input name="date" type="date" required></label><label>Horário<input name="time" type="time"></label></div>
+    <label>Local<input name="venue" maxlength="100" placeholder="Salão, endereço ou espaço"></label>
+    <div class="form-grid"><label>Tipo de evento<select name="type"><option value="batizado">Batizado</option><option value="aniversario">Aniversário</option><option value="casamento">Casamento</option><option value="confraternizacao">Confraternização</option><option value="infantil">Festa infantil</option><option value="personalizado">Personalizado</option></select></label><label>Tema<input name="theme" maxlength="60" placeholder="Ex.: Jardim encantado"></label></div>
+    <div class="form-grid"><label>Cor principal<input name="color" type="color" value="#c77d67"></label><label>Cor de apoio<input name="accent" type="color" value="#e8b7a5"></label></div>
+    <label>Convidados estimados<input name="estimate" type="number" min="0" max="5000" value="50" inputmode="numeric"></label>
+    <div class="modal-actions"><button class="button secondary hidden" id="delete-party" type="button">Excluir festa</button><button class="button primary" type="submit">Salvar festa</button></div>
+  </form></dialog>
+  <dialog id="guest-dialog" class="modal"><form id="guest-form" method="dialog"><div class="modal-head"><div><p class="eyebrow">LISTA DE CONVIDADOS</p><h2 id="guest-dialog-title">Novo convidado</h2></div><button class="close-button" value="cancel" aria-label="Fechar">×</button></div><input type="hidden" name="id"><label>Nome<input name="name" required maxlength="80" placeholder="Nome e sobrenome"></label><label>Grupo ou família<input name="group" maxlength="60" placeholder="Ex.: Família Silva"></label><label>Confirmação<select name="status"><option value="pendente">Pendente</option><option value="confirmado">Confirmado</option><option value="recusou">Recusou</option></select></label><label>Observações<textarea name="notes" rows="3" placeholder="Alergias, acompanhante…"></textarea></label><div class="modal-actions"><button class="button secondary hidden" id="delete-guest" type="button">Remover</button><button class="button primary" type="submit">Salvar convidado</button></div></form></dialog>
+  <dialog id="task-dialog" class="modal"><form id="task-form" method="dialog"><div class="modal-head"><div><p class="eyebrow">ORGANIZAÇÃO</p><h2 id="task-dialog-title">Nova tarefa</h2></div><button class="close-button" value="cancel" aria-label="Fechar">×</button></div><input type="hidden" name="id"><label>Tarefa<input name="title" required maxlength="100" placeholder="O que precisa ser feito?"></label><div class="form-grid"><label>Prazo<input name="due" type="datetime-local" required></label><label>Responsável<input name="owner" maxlength="60" placeholder="Nome"></label></div><label>Observações<textarea name="notes" rows="2" placeholder="Detalhes úteis"></textarea></label><fieldset class="reminder-field"><legend>Lembretes antes do prazo</legend><div class="reminder-options"><label><input type="checkbox" name="reminders" value="10080"> 7 dias</label><label><input type="checkbox" name="reminders" value="1440"> 1 dia</label><label><input type="checkbox" name="reminders" value="60"> 1 hora</label></div><div class="custom-reminder"><input name="customValue" type="number" min="1" value="2" aria-label="Intervalo personalizado"><select name="customUnit" aria-label="Unidade do intervalo"><option value="60">horas</option><option value="1440">dias</option><option value="10080">semanas</option></select><button class="button tiny secondary" type="button" id="add-custom-reminder">Adicionar</button></div><div id="custom-reminder-chips" class="chip-row"></div></fieldset><div class="modal-actions"><button class="button secondary hidden" id="delete-task" type="button">Remover</button><button class="button primary" type="submit">Salvar tarefa</button></div></form></dialog>
+  <dialog id="table-dialog" class="modal table-modal"><div id="table-detail"></div></dialog>
+  <dialog id="guest-picker-dialog" class="modal"><div id="guest-picker"></div></dialog>
+  <dialog id="party-picker-dialog" class="modal"><div id="party-picker"></div></dialog>
+  <dialog id="add-table-dialog" class="modal"><form id="add-table-form" method="dialog"><div class="modal-head"><div><p class="eyebrow">MAPA DE MESAS</p><h2>Adicionar mesa</h2></div><button class="close-button" value="cancel" aria-label="Fechar">×</button></div><label>Nome da mesa<input name="name" maxlength="35" placeholder="Ex.: Mesa da família"></label><div class="form-grid"><label>Formato<select name="shape"><option value="round">Redonda</option><option value="square">Quadrada</option><option value="rectangular">Retangular</option></select></label><label>Cadeiras<input name="chairs" type="number" min="1" max="20" value="6" inputmode="numeric"></label></div><div class="modal-actions"><button class="button primary" type="submit">Adicionar mesa</button></div></form></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>
