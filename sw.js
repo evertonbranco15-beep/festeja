@@ -1,4 +1,4 @@
-const CACHE_NAME = 'festeja-v8';
+const CACHE_NAME = 'festeja-v9';
 const APP_FILES = ['./', './index.html', './styles.css', './app.js', './manifest.json', './icons/icon-192.svg', './icons/icon-512.svg'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(APP_FILES)).then(() => self.skipWaiting()));
